@@ -1,3 +1,6 @@
+> **Unofficial.** This is a community patch set, not affiliated with MobileGL-Dev.
+> Issues about the patch belong here; issues about MobileGlues itself belong upstream.
+> Prebuilt: [libmobileglues-arm64-v8a.so](https://github.com/Dap-boss/MobileGlues-MC26.3-patch/releases/latest)
 # MobileGlues 26.3 适配补丁
 
 让 [MobileGlues](https://github.com/MobileGL-Dev/MobileGlues) 能在 Minecraft Java 26.3（Fabric）上正常编译并渲染的补丁集。
