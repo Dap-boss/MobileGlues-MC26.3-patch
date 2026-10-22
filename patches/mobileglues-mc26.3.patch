@@ -1,0 +1,275 @@
+﻿diff --git a/MobileGlues-cpp/config/settings.cpp b/MobileGlues-cpp/config/settings.cpp
+index 43d5dd0..69dba0a 100644
+--- a/MobileGlues-cpp/config/settings.cpp
++++ b/MobileGlues-cpp/config/settings.cpp
+@@ -298,7 +298,7 @@ const md_backend_name_t k_md_backend_names[] = {
+ // native/EXT form of the same function before everything else, compute last
+ // because the old Auto never picked it on its own either.
+ const char* const k_md_default_global_order[] = {
+-    "native", "multiindirect", "multibasevertex", "multiarrays", "indirect", "basevertex", "unroll", "compute",
++    "compute", "native", "multiindirect", "multibasevertex", "multiarrays", "indirect", "basevertex", "unroll",
+ };
+ constexpr int MD_GLOBAL_ITEMS = 8;
+ 
+diff --git a/MobileGlues-cpp/gl/framebuffer.cpp b/MobileGlues-cpp/gl/framebuffer.cpp
+index cb2585a..7889e07 100644
+--- a/MobileGlues-cpp/gl/framebuffer.cpp
++++ b/MobileGlues-cpp/gl/framebuffer.cpp
+@@ -164,6 +164,15 @@ void init_framebuffer(framebuffer_t& fbo) {
+     // a heap write past the end.
+     if (fbo.color_attachments.size() < want) fbo.color_attachments.resize(want, attachment_t{});
+ }
++// Redundant-bind elimination. MC 26.x switches render targets several times per
++// frame; each call otherwise costs the bookkeeping above plus a driver call. The
++// cache mirrors the two bindings as they were last *actually* pushed to the
++// backend. It is kept disabled while FSR1 owns the draw binding (g_renderFBO
++// != 0), because FSR1 binds the backend directly and would desync it.
++static GLuint fb_cache_draw = 0;
++static GLuint fb_cache_read = 0;
++static bool fb_cache_valid = false;
++
+ void glBindFramebuffer(GLenum target, GLuint framebuffer) {
+     LOG()
+     LOG_D("glBindFramebuffer, target = %s, framebuffer = %u", glEnumToString(target), framebuffer)
+@@ -203,10 +212,37 @@ void glBindFramebuffer(GLenum target, GLuint framebuffer) {
+     }
+ 
+     if (target == GL_FRAMEBUFFER && draw_fb != framebuffer) {
++        if (fb_cache_valid && fb_cache_draw == draw_fb && fb_cache_read == framebuffer) return;
++        GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fb);
++        GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
++        if (FSR1_Context::g_renderFBO == 0) {
++            fb_cache_draw = draw_fb;
++            fb_cache_read = framebuffer;
++            fb_cache_valid = true;
++        } else {
++            fb_cache_valid = false;
++        }
++    } else if (target == GL_DRAW_FRAMEBUFFER) {
++        if (fb_cache_valid && fb_cache_draw == draw_fb) return;
+         GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fb);
++        if (FSR1_Context::g_renderFBO == 0) {
++            fb_cache_draw = draw_fb;
++            fb_cache_valid = true;
++        } else {
++            fb_cache_valid = false;
++        }
++    } else if (target == GL_READ_FRAMEBUFFER) {
++        if (fb_cache_valid && fb_cache_read == framebuffer) return;
+         GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
++        if (FSR1_Context::g_renderFBO == 0) {
++            fb_cache_read = framebuffer;
++            fb_cache_valid = true;
++        } else {
++            fb_cache_valid = false;
++        }
+     } else {
+         GLES.glBindFramebuffer(target, draw_fb);
++        fb_cache_valid = false;
+     }
+ }
+ // Only the outermost scope on a thread touches the binding.
+@@ -224,6 +260,7 @@ mg_fsr_read_scope_t::mg_fsr_read_scope_t() {
+     counted = true;
+     if (g_fsr_read_depth++ > 0) return; // an outer scope already holds it
+     active = true;
++    fb_cache_valid = false;
+     GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, FSR1_Context::g_renderFBO);
+ }
+ mg_fsr_read_scope_t::~mg_fsr_read_scope_t() {
+@@ -231,7 +268,10 @@ mg_fsr_read_scope_t::~mg_fsr_read_scope_t() {
+     --g_fsr_read_depth;
+     // Back to the raw surface, which is what the tracked binding of 0 means for
+     // the read target -- glBindFramebuffer never redirects that one.
+-    if (active) GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    if (active) {
++        fb_cache_valid = false;
++        GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    }
+ }
+ 
+ // Record what is now attached at `attachment`. Only colour attachments are kept:
+diff --git a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+index c7eee88..ccab1cc 100644
+--- a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
++++ b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+@@ -16,6 +16,8 @@
+ #include "glslang/SPIRV/GlslangToSpv.h"
+ #include <string>
+ #include <regex>
++#include <vector>
++#include <cctype>
+ #include <strstream>
+ #include <algorithm>
+ #include <sstream>
+@@ -249,7 +251,11 @@ std::string process_uniform_declarations(const std::string& glslCode) {
+     result.reserve(glslCode.length());
+ 
+     while (scan_pos < length) {
+-        if (glslCode.compare(scan_pos, 7, "uniform") == 0) {
++        const bool uniform_token_start =
++            scan_pos == 0 || !(std::isalnum((unsigned char)glslCode[scan_pos - 1]) || glslCode[scan_pos - 1] == '_');
++        const bool uniform_token_end =
++            scan_pos + 7 >= length || std::isspace((unsigned char)glslCode[scan_pos + 7]);
++        if (uniform_token_start && uniform_token_end && glslCode.compare(scan_pos, 7, "uniform") == 0) {
+             if (scan_pos > chunk_start) {
+                 result.append(glslCode, chunk_start, scan_pos - chunk_start);
+             }
+@@ -838,6 +844,80 @@ std::string spirv_to_essl(std::vector<unsigned int> spirv, uint essl_version, in
+     return essl;
+ }
+ 
++
++// Adreno rejects dynamic indexing of fragment output arrays (S0015). MC 26.x does
++// exactly that in its OIT transmittance shader (`out vec4 coeff[N]` written through a
++// loop counter). Move the array into a global local array, then flush it into scalar
++// outputs with constant indices at the end of main().
++static size_t find_main_close(const std::string& s) {
++    size_t p = s.find("void main");
++    if (p == std::string::npos) return std::string::npos;
++    p = s.find('{', p);
++    if (p == std::string::npos) return std::string::npos;
++    int depth = 0;
++    for (size_t i = p; i < s.size(); ++i) {
++        char c = s[i];
++        if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') {
++            while (i < s.size() && s[i] != '\n') ++i;
++            continue;
++        }
++        if (c == '/' && i + 1 < s.size() && s[i + 1] == '*') {
++            i += 2;
++            while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) ++i;
++            ++i;
++            continue;
++        }
++        if (c == '{') ++depth;
++        else if (c == '}') {
++            --depth;
++            if (depth == 0) return i;
++        }
++    }
++    return std::string::npos;
++}
++
++std::string legalize_output_arrays(const std::string& glsl) {
++    static const std::regex re(
++        R"(layout\(location\s*=\s*(\d+)\)\s*(highp |mediump |lowp )?out\s+(highp |mediump |lowp )?(vec4|vec3|vec2|float|int|ivec4|uvec4)\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]\s*;)");
++    struct out_array_t {
++        std::string name;
++        int location;
++        int size;
++    };
++    std::vector<out_array_t> arrays;
++    std::string out;
++    size_t last = 0;
++    for (auto it = std::sregex_iterator(glsl.begin(), glsl.end(), re); it != std::sregex_iterator(); ++it) {
++        const std::smatch& m = *it;
++        out_array_t a;
++        a.location = std::stoi(std::string(m[1].first, m[1].second));
++        a.name = std::string(m[5].first, m[5].second);
++        a.size = std::stoi(std::string(m[6].first, m[6].second));
++        std::string precision = m[3].matched ? std::string(m[3].first, m[3].second) : (m[2].matched ? std::string(m[2].first, m[2].second) : std::string("highp "));
++        out.append(glsl, last, m.position() - last);
++        out += precision + std::string(m[4].first, m[4].second) + " " + a.name + "[" + std::to_string(a.size) + "];";
++        for (int i = 0; i < a.size; ++i) {
++            out += "\nlayout(location = " + std::to_string(a.location + i) + ") out " + precision + std::string(m[4].first, m[4].second) +
++                   " _mg_out_" + a.name + "_" + std::to_string(i) + ";";
++        }
++        last = m.position() + m.length();
++        arrays.push_back(a);
++    }
++    if (arrays.empty()) return glsl;
++    out.append(glsl, last, std::string::npos);
++    size_t close = find_main_close(out);
++    if (close == std::string::npos) return glsl;
++    std::string flush;
++    for (const auto& a : arrays) {
++        for (int i = 0; i < a.size; ++i) {
++            flush += "    _mg_out_" + a.name + "_" + std::to_string(i) + " = " + a.name + "[" + std::to_string(i) +
++                     "];\n";
++        }
++    }
++    out.insert(close, flush);
++    return out;
++}
++
+ static bool glslang_inited = false;
+ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code) {
+     std::string correct_glsl_str = preprocess_glsl(glsl_code, glsl_type);
+@@ -869,6 +949,9 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
+     }
+     essl = processOutColorLocations(essl);
+     essl = forceSupporterOutput(essl);
++    if (glsl_type == GL_FRAGMENT_SHADER) {
++        essl = legalize_output_arrays(essl);
++    }
+ 
+     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())
+     return_code = errc;
+diff --git a/MobileGlues-cpp/gl/multidraw.cpp b/MobileGlues-cpp/gl/multidraw.cpp
+index b925887..566522a 100644
+--- a/MobileGlues-cpp/gl/multidraw.cpp
++++ b/MobileGlues-cpp/gl/multidraw.cpp
+@@ -612,6 +612,20 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const v
+     func_ptr(mode, count, type, indices, primcount);
+ }
+ 
++static const char* md_backend_name_local(md_backend_t b) {
++    switch (b) {
++    case md_backend_t::Auto: return "auto";
++    case md_backend_t::Unroll: return "unroll";
++    case md_backend_t::BaseVertex: return "basevertex";
++    case md_backend_t::Indirect: return "indirect";
++    case md_backend_t::MultiArrays: return "multiarrays";
++    case md_backend_t::MultiBaseVertex: return "multibasevertex";
++    case md_backend_t::MultiIndirect: return "multiindirect";
++    case md_backend_t::Compute: return "compute";
++    default: return "unknown";
++    }
++}
++
+ typedef void (*glMultiDrawElementsBaseVertex_t)(GLenum, GLsizei*, GLenum, const void* const*, GLsizei, const GLint*);
+ 
+ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+@@ -639,6 +653,11 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
+             func_ptr = mg_glMultiDrawElementsBaseVertex_drawelements;
+             break;
+         }
++        // One line, once per process: which implementation the hot terrain path
++        // ended up on. The release build has no other way to tell "one driver call
++        // per batch" apart from "N calls in a loop".
++        LOG_W_FORCE("multidraw[ElementsBaseVertex] backend = %s",
++                    md_backend_name_local(multidraw_backend_of(md_entry_t::ElementsBaseVertex)))
+     }
+ 
+     func_ptr(mode, counts, type, indices, primcount, basevertex);
+diff --git a/MobileGlues-cpp/gl/shader.cpp b/MobileGlues-cpp/gl/shader.cpp
+index cf4043d..40b7e40 100644
+--- a/MobileGlues-cpp/gl/shader.cpp
++++ b/MobileGlues-cpp/gl/shader.cpp
+@@ -16,6 +16,8 @@
+ #include "glsl/glsl_for_es.h"
+ #include "../config/settings.h"
+ #include "FSR1/FSR1.h"
++#include "../config/config.h"
++#include <cstdio>
+ 
+ #define DEBUG 0
+ 
+@@ -114,6 +116,16 @@ void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) {
+         GLchar infoLog[512];
+         GLES.glGetShaderInfoLog(shader, 512, nullptr, infoLog);
+         LOG_W_FORCE("Shader %d compilation failed: \n%s", shader, infoLog)
++        {
++            char dump_path[512];
++            snprintf(dump_path, sizeof(dump_path), "%s/fail_%u.glsl",
++                     mg_directory_path ? mg_directory_path : "/sdcard/MG", shader);
++            FILE* fp = fopen(dump_path, "w");
++            if (fp) {
++                fwrite(shaderInfo.converted.data(), 1, shaderInfo.converted.size(), fp);
++                fclose(fp);
++            }
++        }
+         LOG_W_FORCE("Now try to cheat.")
+         *params = GL_TRUE;
+     }
